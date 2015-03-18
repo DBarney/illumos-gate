@@ -20,6 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, Pagoda Box Inc. All rights reserved.
  */
 
 /*	Copyright (c) 1983, 1984, 1985, 1986, 1987, 1988, 1989 AT&T	*/
@@ -64,6 +65,16 @@ extern "C" {
  */
 
 /*
+ * Node for storing cache entries in the reverse lookup
+ */
+struct ncache;
+typedef struct vpncache {
+	struct vpncache *hash_next;
+	struct vpncache *hash_prev;
+	struct ncache *node;
+} vpncache_t;
+
+/*
  * This structure describes the elements in the cache of recent
  * names looked up.
  *
@@ -81,6 +92,7 @@ typedef struct ncache {
 	struct vnode *vp;		/* vnode the name refers to */
 	struct vnode *dp;		/* vnode of parent of name */
 	int hash;			/* hash signature */
+	vpncache_t reverse[4];		/* reverse loookup entries */
 	uchar_t namlen;			/* length of name */
 	char name[1];			/* segment name - null terminated */
 } ncache_t;
@@ -95,6 +107,28 @@ typedef struct nc_hash	{
 } nc_hash_t;
 
 /*
+ * This structure maintains a reverse mapping from vnodes to ncache entries.
+ * The reverse mapping allows for quick purging of entires without needing
+ * to scan all the entries in the hash.
+ */
+typedef struct vpcache {
+	struct vpcache *hash_next;
+	struct vpcache *hash_prev;
+	uintptr_t id;
+	int count;
+	vpncache_t *node;
+} vpcache_t;
+
+/*
+ * Hash table bucket structure of vnode cache entries for fast purging.
+ */
+typedef struct nc_vp_hash	{
+	vpcache_t *hash_next;
+	vpcache_t *hash_prev;
+	kmutex_t hash_lock;
+} nc_vp_hash_t;
+
+/*
  * Statistics on name cache
  * Not protected by locks
  */
@@ -102,7 +136,7 @@ typedef struct nc_hash	{
  * ncstats has been deprecated, due to the integer size of the counters
  * which can easily overflow in the dnlc.
  * It is maintained (at some expense) for compatability.
- * The preferred interface is the kstat accessible nc_stats below, ehich
+ * The preferred interface is the kstat accessible nc_stats below, which
  * is actually shared with directory caching.
  */
 struct ncstats {
@@ -168,6 +202,16 @@ struct nc_stats {
 		ASSERT((Xcp - (name)) <= ((1 << NBBY) - 1));	\
 		(namlen) = Xcp - (name);			\
 	}
+
+/*
+ * The dnlc reverse hashing function
+ * This needs an actual hashing implementation.
+ */
+
+#define	DNLCRHASH(dvp, hash)\
+	{						\
+		hash = (int)((uintptr_t)(dvp)) >> 8;\
+	}						\
 
 #if defined(_KERNEL)
 

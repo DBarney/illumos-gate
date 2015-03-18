@@ -20,6 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, Pagoda Box Inc. All rights reserved.
  */
 
 /*	Copyright (c) 1983, 1984, 1985, 1986, 1987, 1988, 1989 AT&T	*/
@@ -129,6 +130,12 @@ int nc_hashavelen = NC_HASHAVELEN_DEFAULT;
 nc_hash_t *nc_hash;
 
 /*
+ * Hash table of vnode to name cache entries for reverse lookup,
+ * dynamically allocated at startup.
+ */
+nc_vp_hash_t *nc_vp_hash;
+
+/*
  * Rotors. Used to select entries on a round-robin basis.
  */
 static nc_hash_t *dnlc_purge_fs1_rotor;
@@ -145,6 +152,8 @@ int ncsize = -1;
 volatile uint32_t dnlc_nentries = 0;	/* current num of name cache entries */
 static int nc_hashsz;			/* size of hash table */
 static int nc_hashmask;			/* size of hash table minus 1 */
+static int nc_vp_hashsz;		/* size of reverse hash table */
+static int nc_vp_hashmask;		/* size of reverse hash table minus 1 */
 
 /*
  * The dnlc_reduce_cache() taskq queue is activated when there are
@@ -257,6 +266,22 @@ vnode_t negative_cache_vnode;
 	atomic_dec_32(&dnlc_nentries); \
 }
 
+/*
+ * Add an entry to a linked list
+ */
+#define rv_insert_before(node1,node2) \
+{ \
+	(node1)->hash_next = (node2); \
+	(node1)->hash_prev = (node2)->hash_prev; \
+	(node2)->hash_prev->hash_next = (node1); \
+	(node2)->hash_prev = (node1); \
+} \
+
+/*
+ * Remove an entry from a linked list
+ */
+#define rv_remove(node) nc_rmhash(node)
+
 
 /*
  * Cached directory info.
@@ -329,6 +354,9 @@ static void dnlc_dir_abort(dircache_t *dcp);
 static void dnlc_dir_adjust_fhash(dircache_t *dcp);
 static void dnlc_dir_adjust_nhash(dircache_t *dcp);
 static void do_dnlc_reduce_cache(void *);
+static void dnlc_reverse_enter(ncache_t *ncp);
+static void dnlc_reverse_update(ncache_t *ncp,vnode_t *dp,vnode_t *vp);
+static void dnlc_reverse_remove(ncache_t *ncp);
 
 
 /*
@@ -338,6 +366,7 @@ void
 dnlc_init()
 {
 	nc_hash_t *hp;
+	nc_vp_hash_t *vhp;
 	kstat_t *ksp;
 	int i;
 
@@ -380,6 +409,18 @@ dnlc_init()
 		hp->hash_prev = (ncache_t *)hp;
 	}
 
+	/* 
+	 * Initialize reverse lookup map
+	 */
+	nc_vp_hashsz = nc_hashsz;
+	nc_vp_hashmask = nc_vp_hashsz - 1;
+	nc_vp_hash = kmem_zalloc(nc_vp_hashsz * sizeof (*nc_vp_hash), KM_SLEEP);
+	for (i = 0; i < nc_vp_hashsz; i++) {
+		vhp = (nc_vp_hash_t *)&nc_vp_hash[i];
+		mutex_init(&vhp->hash_lock, NULL, MUTEX_DEFAULT, NULL);
+		vhp->hash_next = (vpcache_t *)vhp;
+		vhp->hash_prev = (vpcache_t *)vhp;
+	}
 	/*
 	 * Initialize rotors
 	 */
@@ -434,6 +475,7 @@ dnlc_init()
 void
 dnlc_enter(vnode_t *dp, const char *name, vnode_t *vp)
 {
+	cmn_err(CE_NOTE,"dnlc_enter %s",name);
 	ncache_t *ncp;
 	nc_hash_t *hp;
 	uchar_t namlen;
@@ -478,7 +520,14 @@ dnlc_enter(vnode_t *dp, const char *name, vnode_t *vp)
 	 * Insert back into the hash chain.
 	 */
 	nc_inshash(ncp, hp);
+	
+
+	/*
+	 * Insert the entry into the reverse lookup
+	 */
+	dnlc_reverse_enter(ncp);
 	mutex_exit(&hp->hash_lock);
+
 	ncstats.enters++;
 	ncs.ncs_enters.value.ui64++;
 	TRACE_2(TR_FAC_NFS, TR_DNLC_ENTER_END,
@@ -500,6 +549,7 @@ dnlc_enter(vnode_t *dp, const char *name, vnode_t *vp)
 void
 dnlc_update(vnode_t *dp, const char *name, vnode_t *vp)
 {
+	cmn_err(CE_NOTE,"dnlc_update %s",name);
 	ncache_t *ncp;
 	ncache_t *tcp;
 	vnode_t *tvp;
@@ -541,7 +591,14 @@ dnlc_update(vnode_t *dp, const char *name, vnode_t *vp)
 		if (tcp->vp != vp) {
 			tvp = tcp->vp;
 			tcp->vp = vp;
+			
+
+			/*
+			 * Update the reverse entry
+			 */
+			dnlc_reverse_update(ncp, vp, dp);
 			mutex_exit(&hp->hash_lock);
+
 			VN_RELE_DNLC(tvp);
 			ncstats.enters++;
 			ncs.ncs_enters.value.ui64++;
@@ -564,7 +621,16 @@ dnlc_update(vnode_t *dp, const char *name, vnode_t *vp)
 	 * insert the new entry, since it is not in dnlc yet
 	 */
 	nc_inshash(ncp, hp);
+	
+
+	/*
+	 * Insert the entry into the reverse lookup
+	 */
+	dnlc_reverse_enter(ncp);
 	mutex_exit(&hp->hash_lock);
+
+	
+
 	ncstats.enters++;
 	ncs.ncs_enters.value.ui64++;
 	TRACE_2(TR_FAC_NFS, TR_DNLC_ENTER_END,
@@ -654,6 +720,7 @@ dnlc_lookup(vnode_t *dp, const char *name)
 	TRACE_4(TR_FAC_NFS, TR_DNLC_LOOKUP_END,
 	    "dnlc_lookup_end:%S %d vp %x name %s", "miss", ncstats.misses,
 	    NULL, name);
+	cmn_err(CE_NOTE,"dnlc_lookup %s NULL",name);
 	return (NULL);
 }
 
@@ -663,6 +730,7 @@ dnlc_lookup(vnode_t *dp, const char *name)
 void
 dnlc_remove(vnode_t *dp, const char *name)
 {
+	cmn_err(CE_NOTE,"dnlc_remove %s",name);
 	ncache_t *ncp;
 	nc_hash_t *hp;
 	uchar_t namlen;
@@ -679,7 +747,14 @@ dnlc_remove(vnode_t *dp, const char *name)
 		 * Free up the entry
 		 */
 		nc_rmhash(ncp);
+
+		/*
+		 * Remove the reverse lookup
+		 */
+		dnlc_reverse_remove(ncp);
+
 		mutex_exit(&hp->hash_lock);
+
 		VN_RELE_DNLC(ncp->vp);
 		VN_RELE_DNLC(ncp->dp);
 		dnlc_free(ncp);
@@ -688,14 +763,209 @@ dnlc_remove(vnode_t *dp, const char *name)
 	mutex_exit(&hp->hash_lock);
 }
 
+
+/*
+ * Add an entry to the reverse lookup hash
+ */
+static void
+dnlc_reverse_enter(ncache_t *ncp)
+{
+	cmn_err(CE_NOTE,"%p i_dnlc_reverse_enter start %s",ncp,ncp->name);
+
+
+	nc_vp_hash_t *vhp;
+	vpncache_t *node;
+	vpncache_t *found_node;
+	vpcache_t *vncp;
+	vpcache_t *tncp;
+	int hash;
+	int found;
+	uintptr_t ids[4];
+
+	if (!doingcache)
+		return;
+	/*
+	 * Any of these could be used as a lookup in a purge
+	 * so we have to insert all of them.
+	 */
+	ids[0] = (uintptr_t)ncp->vp;
+	ids[2] = (uintptr_t)ncp->vp->v_vfsp;
+	ids[1] = (uintptr_t)ncp->dp;
+	ids[3] = (uintptr_t)ncp->dp->v_vfsp;
+
+	if (ids[2] == ids[3])
+		ids[3] = NULL;
+	ASSERT(ids[0] != ids[1]);
+
+	for (int i = 0; i < 4; i++ ) {
+		node = &ncp->reverse[i];
+
+		ASSERT(node != NULL);
+		node->hash_next = node;
+		node->hash_prev = node;
+
+		if (ids[i] == NULL) {
+			cmn_err(CE_NOTE,"%p i_dnlc_reverse_enter setting %p to NULL",ncp,node);
+			node->node = NULL;
+			node->hash_next = NULL;
+			node->hash_prev = NULL;
+			continue;
+		}
+		node->node = ncp;
+		found = 0;
+		DNLCRHASH(ids[i], hash);
+		cmn_err(CE_NOTE,"%p i_dnlc_reverse_enter entering %p at %d",ncp,(void*)ids[i],hash);
+		vhp = &nc_vp_hash[hash & nc_vp_hashmask];
+		vncp = kmem_alloc(sizeof (vpcache_t), KM_NOSLEEP);
+
+		mutex_enter(&vhp->hash_lock);
+		for (tncp = (vpcache_t *)vhp->hash_next;
+			(uintptr_t)tncp != (uintptr_t)vhp;
+			tncp = tncp->hash_next) {
+
+			if (tncp->id == ids[i]) {
+				cmn_err(CE_NOTE,"%p i_dnlc_reverse_enter appending %p:%p to %p",ncp,tncp,node,(void*)ids[i]);
+				found = 1;
+
+				tncp->count++;
+				rv_insert_before(node,tncp->node);
+				mutex_exit(&vhp->hash_lock);
+				
+				kmem_free(vncp, sizeof (vpcache_t));
+				break;
+			}
+		}
+
+		if (found == 1) {
+			continue;
+		}
+		cmn_err(CE_NOTE,"%p i_dnlc_reverse_enter creating %p for %p",ncp,vncp,(void*)ids[i]);
+		vncp->id = ids[i];
+		vncp->count = 1;
+		rv_insert_before(vncp,tncp);
+
+		vncp->node = node;
+
+		mutex_exit(&vhp->hash_lock);
+	}
+	cmn_err(CE_NOTE,"%p i_dnlc_reverse_enter stop",ncp);
+}
+
+
+/*
+ * Remove an entry from the reverse lookup hash
+ */
+static void
+i_dnlc_reverse_remove(ncache_t *ncp,vnode_t *dp,vnode_t *vp) {
+	cmn_err(CE_NOTE,"%p dnlc_reverse_remove start %s",ncp,ncp->name);
+	nc_vp_hash_t *vhp;
+	vpncache_t *node;
+	vpcache_t *tncp;
+	int hash;
+	uintptr_t ids[4];
+
+	if (!doingcache)
+		return;
+	/*
+	 * Any of these could be used as a lookup in a purge
+	 * so we have to remove all of them now.
+	 */
+	ids[0] = (uintptr_t)vp;
+	ids[2] = (uintptr_t)vp->v_vfsp;
+	ids[1] = (uintptr_t)dp;
+	ids[3] = (uintptr_t)dp->v_vfsp;
+
+	if (ids[2] == ids[3])
+		ids[3] = NULL;
+	ASSERT(ids[0] != ids[1]);
+
+	for (int i = 0; i < 4; i++ ) {
+		node = &ncp->reverse[i];
+		if (ids[i] == NULL || node->node == NULL) {
+			continue;
+		}
+
+		DNLCRHASH(ids[i], hash);
+		cmn_err(CE_NOTE,"%p dnlc_reverse_remove checking %p at %d",ncp,(void*)ids[i],hash);
+		vhp = &nc_vp_hash[hash & nc_vp_hashmask];
+
+		mutex_enter(&vhp->hash_lock);
+
+		/* we are going to be removing an entry */
+		tncp->count--;
+		
+		if (tncp->count == 0) {
+			ASSERT(node == node->hash_prev);
+			/*
+			 * If we are the only node, we need to drop the
+			 * vpcache_t structure,
+			 * which means we need to look it up.
+			 */
+			 for (tncp = (vpcache_t *)vhp->hash_next;
+				(uintptr_t)tncp != (uintptr_t)vhp;
+				tncp = tncp->hash_next) {
+
+				if (tncp->id == ids[i]) {
+					ASSERT(tncp->node == node);
+					rv_remove(tncp);
+					rv_remove(node);
+					mutex_exit(&vhp->hash_lock);
+					cmn_err(CE_NOTE,"%p dnlc_reverse_remove removing last %p",ncp,tncp);
+
+					kmem_free(tncp, sizeof (vpcache_t));
+					break;
+				}
+			}
+		} else {
+			/*
+			 * we already have a reference to the lookup node, so
+			 * lets remove it from the list
+			 */
+			rv_remove(node);
+			mutex_exit(&vhp->hash_lock);
+			cmn_err(CE_NOTE,"%p dnlc_reverse_remove removing node %p",ncp,node);
+		}
+		node->node = NULL;
+		cmn_err(CE_NOTE,"%p dnlc_reverse_remove setting %p to NULL",ncp,node);
+		
+		
+	}
+	cmn_err(CE_NOTE,"%p dnlc_reverse_remove stop",ncp);
+}
+
+static void
+dnlc_reverse_remove(ncache_t *ncp)
+{
+	i_dnlc_reverse_remove(ncp, ncp->vp, ncp->dp);
+}
+
+/*
+ * Update an entry in the reverse lookup hash
+ */
+static void
+dnlc_reverse_update(ncache_t *ncp,vnode_t *dp,vnode_t *vp)
+{
+	cmn_err(CE_NOTE,"%p dnlc_reverse_update start",ncp);
+	/*
+	 * XXX: There is probably a more efficient way to do this
+	 */
+	i_dnlc_reverse_remove(ncp, dp, vp);
+	dnlc_reverse_enter(ncp);
+	cmn_err(CE_NOTE,"%p dnlc_reverse_update stop",ncp);
+}
+
 /*
  * Purge the entire cache.
  */
 void
 dnlc_purge()
 {
+	cmn_err(CE_NOTE,"dnlc_purge start");
 	nc_hash_t *nch;
+	nc_vp_hash_t *vhp;
 	ncache_t *ncp;
+	vpcache_t *tncp;
+	vpcache_t *prev_tncp;
 	int index;
 	int i;
 	vnode_t *nc_rele[DNLC_MAX_RELE];
@@ -734,67 +1004,158 @@ dnlc_purge()
 			nch--; /* Do current hash chain again */
 		}
 	}
+
+	/*
+	 * Now clear the reverse lookup hash, individual nodes were freed above.
+	 */
+	for (vhp = nc_vp_hash; vhp < &nc_vp_hash[nc_vp_hashsz]; vhp++) {
+		/*
+		 * empty the hash, and then free everything outside of the mutex
+		 */
+		mutex_enter(&vhp->hash_lock);
+		tncp = vhp->hash_next;
+		vhp->hash_next = (vpcache_t *)vhp;
+		vhp->hash_prev = (vpcache_t *)vhp;
+		mutex_exit(&vhp->hash_lock);
+		while ((uintptr_t)tncp != (uintptr_t)vhp) {
+			cmn_err(CE_NOTE,"dnlc_purge node list %p",tncp);
+			prev_tncp = tncp;
+			tncp = tncp->hash_next;
+			kmem_free(prev_tncp, sizeof (vpcache_t));
+		}
+	}
+	cmn_err(CE_NOTE,"dnlc_purge stop");
 }
 
 /*
- * Purge any cache entries referencing a vnode. Exit as soon as the dnlc
- * reference count goes to zero (the caller still holds a reference).
+ * Internal function used to remove lookups associated
+ * with an entire list of reverse lookups
+ */
+static void
+i_dnlc_purge_node_list(vpncache_t *node)
+{
+	vpncache_t *prev_node;
+	char path[MAXNAMELEN];
+	vnode_t *vnode;
+
+	do {
+		if (node->node == NULL) {
+			cmn_err(CE_NOTE,"%p i_dnlc_purge_node_list found NULL?",node);
+			prev_node = node;
+			node = node->hash_next;
+			rv_remove(prev_node);
+			continue;
+		}
+		ncs.ncs_purge_total.value.ui64++;
+		ASSERT(node->node->namlen <= MAXNAMELEN);
+		bcopy(node->node->name, path,
+			node->node->namlen);
+		path[node->node->namlen] = '\0';
+		cmn_err(CE_NOTE,"%p i_dnlc_purge_node_list purging %s",node,path);
+		prev_node = node;
+		node = node->hash_next;
+		rv_remove(prev_node);
+		vnode = prev_node->node->dp;
+
+		/* we clear this out so that the dnlc_remove doesn't try to remove it again */
+		prev_node->node = NULL;
+		
+		dnlc_remove(vnode, path);
+	} while (prev_node != node);
+}
+
+/*
+ * Internal function used to remove all or some of the lookups associated
+ * with either a vnode or a vfs pointer.
+ */
+static int
+i_dlnc_purge(uintptr_t id,int count)
+{
+	nc_vp_hash_t *vhp;
+	vpcache_t *tncp;
+	vpncache_t *node;
+	vpncache_t *rel_node;
+	int hash;
+	int found = 0;
+	int n = 0;
+
+	DNLCRHASH(id,hash);
+	cmn_err(CE_NOTE,"%p i_dlnc_purge checking %d",(void*)id,hash);
+	vhp = &nc_vp_hash[hash & nc_vp_hashmask];
+	mutex_enter(&vhp->hash_lock);
+	for (tncp = vhp->hash_next;
+		(uintptr_t)tncp != (uintptr_t)vhp;
+		tncp = tncp->hash_next) {
+
+		if (tncp->id == id) {
+			cmn_err(CE_NOTE,"%p i_dlnc_purge found %p",(void*)id,tncp);
+			if (count == 0 || count >= tncp->count) {
+				/*
+				 * we are removing all elements from the node
+				 * list
+				 */
+				rv_remove(tncp);
+				mutex_exit(&vhp->hash_lock);
+
+				found = 1;
+				i_dnlc_purge_node_list(tncp->node);
+				kmem_free(tncp, sizeof (vpcache_t));
+			} else {
+				/*
+				 * we are removing a subset of all nodes
+				 * so we walk the list until we have enough
+				 */
+				rel_node = tncp->node;
+				for (node = rel_node->hash_next;
+					n++ < count;
+					node = node->hash_next);
+				
+				/*
+				 * re-assign the first node in the list
+				 * so that node will be one that isn't removed
+				 */
+				tncp->node = rel_node->hash_next;
+				tncp->count -= n;
+
+				/* close one end of the loop */
+				node->hash_next->hash_prev =
+				   rel_node->hash_prev;
+				rel_node->hash_prev->hash_next =
+				   node->hash_next;
+
+				/* close the other end */
+				node->hash_next = rel_node;
+				rel_node->hash_prev = node;
+
+				mutex_exit(&vhp->hash_lock);
+				
+				found = 1;
+				i_dnlc_purge_node_list(node);
+			}
+		}
+	}
+	if (found == 0) {
+		mutex_exit(&vhp->hash_lock);
+	}
+	return (n);
+}
+
+/*
+ * Purge any cache entries referencing a vnode. Lookup all entires that are
+ * associated with the vp, and then remove all of them.
  */
 void
 dnlc_purge_vp(vnode_t *vp)
 {
-	nc_hash_t *nch;
-	ncache_t *ncp;
-	int index;
-	vnode_t *nc_rele[DNLC_MAX_RELE];
-
-	ASSERT(vp->v_count > 0);
-	if (vp->v_count_dnlc == 0) {
-		return;
-	}
-
+	cmn_err(CE_NOTE,"%p dnlc_purge_vp start",vp);
 	if (!doingcache)
 		return;
 
 	ncstats.purges++;
 	ncs.ncs_purge_vp.value.ui64++;
 
-	for (nch = nc_hash; nch < &nc_hash[nc_hashsz]; nch++) {
-		index = 0;
-		mutex_enter(&nch->hash_lock);
-		ncp = nch->hash_next;
-		while (ncp != (ncache_t *)nch) {
-			ncache_t *np;
-
-			np = ncp->hash_next;
-			if (ncp->dp == vp || ncp->vp == vp) {
-				nc_rele[index++] = ncp->vp;
-				nc_rele[index++] = ncp->dp;
-				nc_rmhash(ncp);
-				dnlc_free(ncp);
-				ncs.ncs_purge_total.value.ui64++;
-				if (index == DNLC_MAX_RELE) {
-					ncp = np;
-					break;
-				}
-			}
-			ncp = np;
-		}
-		mutex_exit(&nch->hash_lock);
-
-		/* Release holds on all the vnodes now that we have no locks */
-		while (index) {
-			VN_RELE_DNLC(nc_rele[--index]);
-		}
-
-		if (vp->v_count_dnlc == 0) {
-			return;
-		}
-
-		if (ncp != (ncache_t *)nch) {
-			nch--; /* Do current hash chain again */
-		}
-	}
+	(void) i_dlnc_purge((uintptr_t)vp,0);
+	cmn_err(CE_NOTE,"%p dnlc_purge_vp stop",vp);
 }
 
 /*
@@ -806,12 +1167,8 @@ dnlc_purge_vp(vnode_t *vp)
 int
 dnlc_purge_vfsp(vfs_t *vfsp, int count)
 {
-	nc_hash_t *nch;
-	ncache_t *ncp;
+	cmn_err(CE_NOTE,"%p dnlc_purge_vfsp start count %d",vfsp,count);
 	int n = 0;
-	int index;
-	int i;
-	vnode_t *nc_rele[DNLC_MAX_RELE];
 
 	if (!doingcache)
 		return (0);
@@ -819,48 +1176,12 @@ dnlc_purge_vfsp(vfs_t *vfsp, int count)
 	ncstats.purges++;
 	ncs.ncs_purge_vfs.value.ui64++;
 
-	for (nch = nc_hash; nch < &nc_hash[nc_hashsz]; nch++) {
-		index = 0;
-		mutex_enter(&nch->hash_lock);
-		ncp = nch->hash_next;
-		while (ncp != (ncache_t *)nch) {
-			ncache_t *np;
-
-			np = ncp->hash_next;
-			ASSERT(ncp->dp != NULL);
-			ASSERT(ncp->vp != NULL);
-			if ((ncp->dp->v_vfsp == vfsp) ||
-			    (ncp->vp->v_vfsp == vfsp)) {
-				n++;
-				nc_rele[index++] = ncp->vp;
-				nc_rele[index++] = ncp->dp;
-				nc_rmhash(ncp);
-				dnlc_free(ncp);
-				ncs.ncs_purge_total.value.ui64++;
-				if (index == DNLC_MAX_RELE) {
-					ncp = np;
-					break;
-				}
-				if (count != 0 && n >= count) {
-					break;
-				}
-			}
-			ncp = np;
-		}
-		mutex_exit(&nch->hash_lock);
-		/* Release holds on all the vnodes now that we have no locks */
-		for (i = 0; i < index; i++) {
-			VN_RELE_DNLC(nc_rele[i]);
-		}
-		if (count != 0 && n >= count) {
-			return (n);
-		}
-		if (ncp != (ncache_t *)nch) {
-			nch--; /* Do current hash chain again */
-		}
-	}
+	n = i_dlnc_purge((uintptr_t)vfsp,count);
+	
+	cmn_err(CE_NOTE, "%p dnlc_purge_vfsp stop purged %d", vfsp, n);
 	return (n);
 }
+
 
 /*
  * Purge 1 entry from the dnlc that is part of the filesystem(s)
@@ -908,6 +1229,7 @@ dnlc_fs_purge1(vnodeops_t *vop)
 		}
 		if (ncp != (ncache_t *)hp) {
 			nc_rmhash(ncp);
+			dnlc_reverse_remove(ncp);
 			mutex_exit(&hp->hash_lock);
 			VN_RELE_DNLC(ncp->dp);
 			VN_RELE_DNLC(vp)
@@ -920,50 +1242,6 @@ dnlc_fs_purge1(vnodeops_t *vop)
 	return (0);
 }
 
-/*
- * Perform a reverse lookup in the DNLC.  This will find the first occurrence of
- * the vnode.  If successful, it will return the vnode of the parent, and the
- * name of the entry in the given buffer.  If it cannot be found, or the buffer
- * is too small, then it will return NULL.  Note that this is a highly
- * inefficient function, since the DNLC is constructed solely for forward
- * lookups.
- */
-vnode_t *
-dnlc_reverse_lookup(vnode_t *vp, char *buf, size_t buflen)
-{
-	nc_hash_t *nch;
-	ncache_t *ncp;
-	vnode_t *pvp;
-
-	if (!doingcache)
-		return (NULL);
-
-	for (nch = nc_hash; nch < &nc_hash[nc_hashsz]; nch++) {
-		mutex_enter(&nch->hash_lock);
-		ncp = nch->hash_next;
-		while (ncp != (ncache_t *)nch) {
-			/*
-			 * We ignore '..' entries since it can create
-			 * confusion and infinite loops.
-			 */
-			if (ncp->vp == vp && !(ncp->namlen == 2 &&
-			    0 == bcmp(ncp->name, "..", 2)) &&
-			    ncp->namlen < buflen) {
-				bcopy(ncp->name, buf, ncp->namlen);
-				buf[ncp->namlen] = '\0';
-				pvp = ncp->dp;
-				/* VN_HOLD 2 of 2 in this file */
-				VN_HOLD_CALLER(pvp);
-				mutex_exit(&nch->hash_lock);
-				return (pvp);
-			}
-			ncp = ncp->hash_next;
-		}
-		mutex_exit(&nch->hash_lock);
-	}
-
-	return (NULL);
-}
 /*
  * Utility routine to search for a cache entry. Return the
  * ncache entry if found, NULL otherwise.
@@ -1121,6 +1399,7 @@ found:
 		 * Remove from hash chain.
 		 */
 		nc_rmhash(ncp);
+		dnlc_reverse_remove(ncp);
 		mutex_exit(&hp->hash_lock);
 		VN_RELE_DNLC(vp);
 		VN_RELE_DNLC(ncp->dp);
