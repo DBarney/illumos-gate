@@ -1095,6 +1095,7 @@ i_dlnc_purge(uintptr_t id,int count)
 				 * list
 				 */
 				rv_remove(tncp);
+				n = tncp->count;
 				mutex_exit(&vhp->hash_lock);
 
 				found = 1;
